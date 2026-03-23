@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.vercel
+.venv/
+venv/
+brz-monitor/
+brz-monitor.zip
