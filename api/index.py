@@ -111,12 +111,20 @@ async def send_telegram(message: str, chat_id: str = None) -> None:
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
 
+def _brz_per_brl(price_brl: float | None) -> float | None:
+    if not price_brl:
+        return None
+    return 1 / price_brl
+
 def fmt_price_report(p: dict, titulo: str = "📊 Atualização de Preço") -> str:
     arrow = "🔺" if p["change_24h"] > 0 else "🔻"
+    inv_brl = _brz_per_brl(p.get("price_brl"))
+    inv_line = f"🔁 <b>1 BRL:</b>  <code>{inv_brl:.6f} BRZ</code>\n" if inv_brl else ""
     return (
         f"{titulo} — <b>BRZ</b>\n\n"
         f"💵 <b>USD:</b>  <code>${p['price_usd']:.6f}</code>\n"
         f"🇧🇷 <b>BRL:</b>  <code>R${p['price_brl']:.6f}</code>\n"
+        f"{inv_line}"
         f"📦 <b>Vol 24h:</b>  <code>${p['volume_usd']:,.0f}</code>\n"
         f"{arrow} <b>Var 24h:</b>  {p['change_24h']:+.2f}%\n\n"
         f"🕐 {_ts()}"
@@ -124,21 +132,27 @@ def fmt_price_report(p: dict, titulo: str = "📊 Atualização de Preço") -> s
 
 def fmt_price_alert(p: dict, pct_brl: float, pct_usd: float) -> str:
     arrow = "🔺" if pct_usd > 0 else "🔻"
+    inv_brl = _brz_per_brl(p.get("price_brl"))
+    inv_line = f"🔁 <b>1 BRL:</b>  <code>{inv_brl:.6f} BRZ</code>\n" if inv_brl else ""
     return (
         f"{arrow} <b>ALERTA DE VARIAÇÃO — BRZ</b>\n\n"
         f"💵 <b>USD:</b>  <code>${p['price_usd']:.6f}</code>  ({pct_usd:+.2f}%)\n"
         f"🇧🇷 <b>BRL:</b>  <code>R${p['price_brl']:.6f}</code>  ({pct_brl:+.2f}%)\n"
+        f"{inv_line}"
         f"📦 <b>Vol 24h:</b>  <code>${p['volume_usd']:,.0f}</code>\n"
         f"📈 <b>Var 24h:</b>  {p['change_24h']:+.2f}%\n\n"
         f"🕐 {_ts()}"
     )
 
 def fmt_volume_alert(p: dict, pct_vol: float) -> str:
+    inv_brl = _brz_per_brl(p.get("price_brl"))
+    inv_line = f"🔁 1 BRL:  <code>{inv_brl:.6f} BRZ</code>\n" if inv_brl else ""
     return (
         f"📢 <b>ALERTA DE VOLUME ANORMAL — BRZ</b>\n\n"
         f"📦 <b>Volume atual:</b>  <code>${p['volume_usd']:,.0f}</code>  ({pct_vol:+.1f}%)\n\n"
         f"💵 USD:  <code>${p['price_usd']:.6f}</code>\n"
         f"🇧🇷 BRL:  <code>R${p['price_brl']:.6f}</code>\n\n"
+        f"{inv_line}"
         f"🕐 {_ts()}"
     )
 
