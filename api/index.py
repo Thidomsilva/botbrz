@@ -1,45 +1,70 @@
 """
 BRZ Monitor - Backend FastAPI para Vercel
 Monitora preço e volume do BRZ e envia alertas no Telegram.
+
+Arquitetura 24/7 serverless:
+  - Estado persistido no Upstash Redis (REST API)
+  - Checagem acionada por cron externo (cron-job.org) via GET /api/check
+  - Sem scheduler interno (incompatível com serverless)
 """
 
 import os
-import json
 import time
 import httpx
 from datetime import datetime, timezone
-from fastapi import FastAPI, BackgroundTasks, Request
-from fastapi.responses import JSONResponse
-from apscheduler.schedulers.background import BackgroundScheduler
+from fastapi import FastAPI, Request
 
 app = FastAPI(title="BRZ Monitor API")
 
-# ── Configurações via variáveis de ambiente ──────────────────────────────────
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")   # opcional - plano gratuito funciona
+# ── Configurações ─────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN              = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID            = os.getenv("TELEGRAM_CHAT_ID", "")
+COINGECKO_API_KEY           = os.getenv("COINGECKO_API_KEY", "")
+UPSTASH_URL                 = os.getenv("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_TOKEN               = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
-# Limites configuráveis (podem virar env vars futuramente)
-PRICE_CHANGE_THRESHOLD_PCT = float(os.getenv("PRICE_CHANGE_PCT", "1.5"))   # % de variação para alertar
-VOLUME_CHANGE_THRESHOLD_PCT = float(os.getenv("VOLUME_CHANGE_PCT", "80"))  # % de aumento de volume
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL", "60"))            # frequência de checagem
+PRICE_CHANGE_THRESHOLD_PCT  = float(os.getenv("PRICE_CHANGE_PCT", "1.5"))
+VOLUME_CHANGE_THRESHOLD_PCT = float(os.getenv("VOLUME_CHANGE_PCT", "80"))
+PRICE_REPORT_INTERVAL_MIN   = int(os.getenv("PRICE_REPORT_INTERVAL", "5"))
 
-# ── Estado em memória (substituir por Redis/DB em produção) ──────────────────
-state = {
-    "last_price_brl": None,
-    "last_price_usd": None,
-    "last_volume_usd": None,
-    "last_check": None,
-    "alerts_sent": 0,
-    "history": [],          # últimas 100 leituras
-}
+# ── Upstash Redis (REST) ──────────────────────────────────────────────────────
+async def redis_get(key: str) -> str | None:
+    if not UPSTASH_URL:
+        return None
+    async with httpx.AsyncClient(timeout=5) as c:
+        r = await c.get(
+            f"{UPSTASH_URL}/get/{key}",
+            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+        )
+        return r.json().get("result")
+
+async def redis_set(key: str, value: str) -> None:
+    if not UPSTASH_URL:
+        return
+    async with httpx.AsyncClient(timeout=5) as c:
+        await c.post(
+            f"{UPSTASH_URL}/set/{key}",
+            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+            json=[value],
+        )
+
+async def redis_mget(*keys: str) -> list:
+    """Busca múltiplas chaves num único round-trip."""
+    if not UPSTASH_URL:
+        return [None] * len(keys)
+    async with httpx.AsyncClient(timeout=5) as c:
+        r = await c.post(
+            f"{UPSTASH_URL}/pipeline",
+            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+            json=[["GET", k] for k in keys],
+        )
+        return [item.get("result") for item in r.json()]
 
 # ── CoinGecko ────────────────────────────────────────────────────────────────
 COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
 BRZ_ID = "brz"
 
 async def fetch_brz_price() -> dict | None:
-    """Busca preço e volume do BRZ na CoinGecko."""
     params = {
         "ids": BRZ_ID,
         "vs_currencies": "brl,usd",
@@ -47,10 +72,7 @@ async def fetch_brz_price() -> dict | None:
         "include_24hr_change": "true",
         "include_last_updated_at": "true",
     }
-    headers = {}
-    if COINGECKO_API_KEY:
-        headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
-
+    headers = {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(COINGECKO_URL, params=params, headers=headers)
@@ -61,187 +83,193 @@ async def fetch_brz_price() -> dict | None:
                 "price_usd": data.get("usd"),
                 "volume_usd": data.get("usd_24h_vol"),
                 "change_24h": data.get("usd_24h_change"),
-                "updated_at": data.get("last_updated_at"),
                 "fetched_at": int(time.time()),
             }
     except Exception as e:
         print(f"[BRZ] Erro ao buscar preço: {e}")
         return None
 
-# ── Telegram ─────────────────────────────────────────────────────────────────
-async def send_telegram(message: str):
-    """Envia mensagem para o chat configurado."""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[Telegram] Token ou chat_id não configurado.")
+# ── Telegram ──────────────────────────────────────────────────────────────────
+async def send_telegram(message: str, chat_id: str = None) -> None:
+    if not TELEGRAM_TOKEN:
         return
+    cid = chat_id or TELEGRAM_CHAT_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(url, json=payload)
+            await client.post(url, json={
+                "chat_id": cid,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            })
     except Exception as e:
-        print(f"[Telegram] Erro ao enviar mensagem: {e}")
+        print(f"[Telegram] Erro: {e}")
 
-def format_price_alert(current: dict, pct_brl: float, pct_usd: float) -> str:
+# ── Mensagens ─────────────────────────────────────────────────────────────────
+def _ts() -> str:
+    return datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+
+def fmt_price_report(p: dict, titulo: str = "📊 Atualização de Preço") -> str:
+    arrow = "🔺" if p["change_24h"] > 0 else "🔻"
+    return (
+        f"{titulo} — <b>BRZ</b>\n\n"
+        f"💵 <b>USD:</b>  <code>${p['price_usd']:.6f}</code>\n"
+        f"🇧🇷 <b>BRL:</b>  <code>R${p['price_brl']:.6f}</code>\n"
+        f"📦 <b>Vol 24h:</b>  <code>${p['volume_usd']:,.0f}</code>\n"
+        f"{arrow} <b>Var 24h:</b>  {p['change_24h']:+.2f}%\n\n"
+        f"🕐 {_ts()}"
+    )
+
+def fmt_price_alert(p: dict, pct_brl: float, pct_usd: float) -> str:
     arrow = "🔺" if pct_usd > 0 else "🔻"
-    ts = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
     return (
         f"{arrow} <b>ALERTA DE VARIAÇÃO — BRZ</b>\n\n"
-        f"💵 <b>USD:</b> <code>${current['price_usd']:.6f}</code>  ({pct_usd:+.2f}%)\n"
-        f"🇧🇷 <b>BRL:</b> <code>R${current['price_brl']:.6f}</code>  ({pct_brl:+.2f}%)\n"
-        f"📊 <b>Vol 24h:</b> <code>${current['volume_usd']:,.0f}</code>\n"
-        f"📈 <b>Var 24h:</b> {current['change_24h']:+.2f}%\n\n"
-        f"🕐 {ts}"
+        f"💵 <b>USD:</b>  <code>${p['price_usd']:.6f}</code>  ({pct_usd:+.2f}%)\n"
+        f"🇧🇷 <b>BRL:</b>  <code>R${p['price_brl']:.6f}</code>  ({pct_brl:+.2f}%)\n"
+        f"📦 <b>Vol 24h:</b>  <code>${p['volume_usd']:,.0f}</code>\n"
+        f"📈 <b>Var 24h:</b>  {p['change_24h']:+.2f}%\n\n"
+        f"🕐 {_ts()}"
     )
 
-def format_volume_alert(current: dict, pct_vol: float) -> str:
-    ts = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+def fmt_volume_alert(p: dict, pct_vol: float) -> str:
     return (
         f"📢 <b>ALERTA DE VOLUME ANORMAL — BRZ</b>\n\n"
-        f"📦 <b>Volume atual:</b> <code>${current['volume_usd']:,.0f}</code>\n"
-        f"📈 <b>Variação de volume:</b> {pct_vol:+.1f}%\n\n"
-        f"💵 USD: <code>${current['price_usd']:.6f}</code>\n"
-        f"🇧🇷 BRL: <code>R${current['price_brl']:.6f}</code>\n\n"
-        f"🕐 {ts}"
+        f"📦 <b>Volume atual:</b>  <code>${p['volume_usd']:,.0f}</code>  ({pct_vol:+.1f}%)\n\n"
+        f"💵 USD:  <code>${p['price_usd']:.6f}</code>\n"
+        f"🇧🇷 BRL:  <code>R${p['price_brl']:.6f}</code>\n\n"
+        f"🕐 {_ts()}"
     )
 
-# ── Lógica de monitoramento ───────────────────────────────────────────────────
-async def check_and_alert():
-    """Função principal de checagem — chamada pelo scheduler e pelo endpoint /check."""
+# ── Checagem principal ────────────────────────────────────────────────────────
+async def check_and_alert() -> dict:
+    """Chamada pelo cron externo (GET /api/check) a cada minuto."""
+
+    # Lê todo o estado do Redis num único round-trip
+    vals = await redis_mget(
+        "bot_enabled", "last_price_usd", "last_price_brl",
+        "last_volume_usd", "last_report_ts", "alerts_sent"
+    )
+    bot_enabled, lp_usd, lp_brl, lv, lr_ts, al_sent = vals
+
+    # Se desativado, não faz nada
+    if bot_enabled == "0":
+        return {"status": "disabled"}
+
     current = await fetch_brz_price()
     if not current:
         return {"status": "error", "message": "Falha ao buscar preço"}
 
-    alerts = []
+    now           = int(time.time())
+    last_usd      = float(lp_usd)  if lp_usd  else None
+    last_brl      = float(lp_brl)  if lp_brl  else None
+    last_vol      = float(lv)      if lv       else None
+    last_rpt      = int(lr_ts)     if lr_ts    else 0
+    alerts_sent   = int(al_sent)   if al_sent  else 0
+    alerts        = []
 
-    # Salva no histórico (máx 100 entradas)
-    state["history"].append(current)
-    if len(state["history"]) > 100:
-        state["history"].pop(0)
-
-    state["last_check"] = current["fetched_at"]
-
-    # ── Alerta de variação de preço ─────────────────────────────────────────
-    if state["last_price_usd"] is not None:
-        pct_usd = ((current["price_usd"] - state["last_price_usd"]) / state["last_price_usd"]) * 100
-        pct_brl = ((current["price_brl"] - state["last_price_brl"]) / state["last_price_brl"]) * 100
-
+    # ── Alerta de variação de preço ───────────────────────────────────────────
+    if last_usd:
+        pct_usd = ((current["price_usd"] - last_usd) / last_usd) * 100
+        pct_brl = ((current["price_brl"] - last_brl) / last_brl) * 100
         if abs(pct_usd) >= PRICE_CHANGE_THRESHOLD_PCT:
-            msg = format_price_alert(current, pct_brl, pct_usd)
-            await send_telegram(msg)
-            state["alerts_sent"] += 1
-            alerts.append({"type": "price", "pct_usd": pct_usd, "pct_brl": pct_brl})
+            await send_telegram(fmt_price_alert(current, pct_brl, pct_usd))
+            alerts_sent += 1
+            alerts.append({"type": "price_alert", "pct_usd": round(pct_usd, 3)})
 
-    # ── Alerta de volume anormal ────────────────────────────────────────────
-    if state["last_volume_usd"] and current["volume_usd"]:
-        pct_vol = ((current["volume_usd"] - state["last_volume_usd"]) / state["last_volume_usd"]) * 100
+    # ── Alerta de volume anormal ──────────────────────────────────────────────
+    if last_vol and current["volume_usd"]:
+        pct_vol = ((current["volume_usd"] - last_vol) / last_vol) * 100
         if pct_vol >= VOLUME_CHANGE_THRESHOLD_PCT:
-            msg = format_volume_alert(current, pct_vol)
-            await send_telegram(msg)
-            state["alerts_sent"] += 1
-            alerts.append({"type": "volume", "pct_vol": pct_vol})
+            await send_telegram(fmt_volume_alert(current, pct_vol))
+            alerts_sent += 1
+            alerts.append({"type": "volume_alert", "pct_vol": round(pct_vol, 1)})
 
-    # Atualiza estado
-    state["last_price_brl"] = current["price_brl"]
-    state["last_price_usd"] = current["price_usd"]
-    state["last_volume_usd"] = current["volume_usd"]
+    # ── Atualização periódica de preço ────────────────────────────────────────
+    elapsed_min = (now - last_rpt) / 60
+    if elapsed_min >= PRICE_REPORT_INTERVAL_MIN:
+        await send_telegram(fmt_price_report(current))
+        await redis_set("last_report_ts", str(now))
+        alerts.append({"type": "periodic_report"})
+
+    # Persiste novo estado
+    await redis_set("last_price_usd", str(current["price_usd"]))
+    await redis_set("last_price_brl", str(current["price_brl"]))
+    await redis_set("last_volume_usd", str(current["volume_usd"]))
+    await redis_set("last_check", str(now))
+    await redis_set("alerts_sent", str(alerts_sent))
 
     return {"status": "ok", "current": current, "alerts": alerts}
-
-# ── Scheduler (cron interno) ──────────────────────────────────────────────────
-scheduler = BackgroundScheduler()
-
-@app.on_event("startup")
-def start_scheduler():
-    import asyncio
-
-    def run_check():
-        asyncio.run(check_and_alert())
-
-    scheduler.add_job(run_check, "interval", seconds=CHECK_INTERVAL_SECONDS, id="brz_check")
-    scheduler.start()
-    print(f"[BRZ] Scheduler iniciado — intervalo: {CHECK_INTERVAL_SECONDS}s")
-
-@app.on_event("shutdown")
-def stop_scheduler():
-    scheduler.shutdown()
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {"service": "BRZ Monitor", "status": "running"}
 
-@app.get("/api/status")
-async def status():
-    """Retorna estado atual do monitor."""
-    return {
-        "last_price_usd": state["last_price_usd"],
-        "last_price_brl": state["last_price_brl"],
-        "last_volume_usd": state["last_volume_usd"],
-        "last_check": state["last_check"],
-        "alerts_sent": state["alerts_sent"],
-        "config": {
-            "price_threshold_pct": PRICE_CHANGE_THRESHOLD_PCT,
-            "volume_threshold_pct": VOLUME_CHANGE_THRESHOLD_PCT,
-            "check_interval_seconds": CHECK_INTERVAL_SECONDS,
-        },
-    }
-
 @app.get("/api/check")
-async def manual_check(background_tasks: BackgroundTasks):
-    """Dispara checagem manual e retorna resultado."""
-    result = await check_and_alert()
-    return result
+async def api_check():
+    """Chamado pelo cron externo (cron-job.org) a cada minuto."""
+    return await check_and_alert()
 
-@app.get("/api/history")
-async def history(limit: int = 20):
-    """Retorna histórico de leituras."""
-    return {"history": state["history"][-limit:], "total": len(state["history"])}
+@app.get("/api/status")
+async def api_status():
+    vals = await redis_mget(
+        "bot_enabled", "last_price_usd", "last_price_brl",
+        "last_volume_usd", "last_check", "alerts_sent", "last_report_ts"
+    )
+    keys = ["bot_enabled", "last_price_usd", "last_price_brl",
+            "last_volume_usd", "last_check", "alerts_sent", "last_report_ts"]
+    return dict(zip(keys, vals))
 
 @app.post("/api/telegram/webhook")
 async def telegram_webhook(request: Request):
-    """Webhook do Telegram para processar comandos do bot."""
+    """Processa comandos do Telegram."""
     body = await request.json()
     message = body.get("message", {})
-    text = message.get("text", "").strip()
-    chat_id = message.get("chat", {}).get("id")
+    text     = message.get("text", "").strip().lower().split()[0]  # pega só o comando
+    chat_id  = str(message.get("chat", {}).get("id", ""))
 
-    if not chat_id:
+    if not chat_id or not text.startswith("/"):
         return {"ok": True}
 
-    if text == "/status" or text.startswith("/status"):
+    if text in ("/preco", "/status"):
         price = await fetch_brz_price()
-        if price:
-            ts = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
-            reply = (
-                f"📊 <b>BRZ — Status Atual</b>\n\n"
-                f"💵 <b>USD:</b> <code>${price['price_usd']:.6f}</code>\n"
-                f"🇧🇷 <b>BRL:</b> <code>R${price['price_brl']:.6f}</code>\n"
-                f"📦 <b>Vol 24h:</b> <code>${price['volume_usd']:,.0f}</code>\n"
-                f"📈 <b>Var 24h:</b> {price['change_24h']:+.2f}%\n\n"
-                f"🤖 Alertas enviados: {state['alerts_sent']}\n"
-                f"🕐 {ts}"
-            )
-        else:
-            reply = "❌ Não foi possível obter o preço agora. Tente novamente."
+        reply = fmt_price_report(price, "📊 Preço Atual") if price else "❌ Não foi possível obter o preço agora."
+        await send_telegram(reply, chat_id)
 
-        await send_telegram(reply)
+    elif text == "/ativar":
+        await redis_set("bot_enabled", "1")
+        await redis_set("last_report_ts", "0")   # força envio imediato no próximo cron
+        reply = (
+            "✅ <b>Monitor ativado!</b>\n\n"
+            f"Você receberá:\n"
+            f"• Atualização de preço a cada {PRICE_REPORT_INTERVAL_MIN} min\n"
+            f"• Alerta quando preço variar ≥ {PRICE_CHANGE_THRESHOLD_PCT}%\n"
+            f"• Alerta quando volume subir ≥ {VOLUME_CHANGE_THRESHOLD_PCT}%"
+        )
+        await send_telegram(reply, chat_id)
+
+    elif text == "/desativar":
+        await redis_set("bot_enabled", "0")
+        reply = "⏸ <b>Monitor pausado.</b>\n\nEnvie /ativar para reativar."
+        await send_telegram(reply, chat_id)
 
     elif text == "/help":
+        enabled = await redis_get("bot_enabled")
+        status_emoji = "✅ Ativo" if enabled != "0" else "⏸ Pausado"
         reply = (
-            "🤖 <b>BRZ Monitor — Comandos</b>\n\n"
-            "/status — Preço e volume atuais do BRZ\n"
-            "/help — Esta mensagem\n\n"
-            f"⚙️ Alertas ativos:\n"
-            f"• Variação de preço ≥ {PRICE_CHANGE_THRESHOLD_PCT}%\n"
-            f"• Variação de volume ≥ {VOLUME_CHANGE_THRESHOLD_PCT}%\n"
-            f"• Checagem a cada {CHECK_INTERVAL_SECONDS}s"
+            f"🤖 <b>BRZ Monitor — Comandos</b>\n\n"
+            f"/ativar — Ativa o monitoramento\n"
+            f"/desativar — Pausa o monitoramento\n"
+            f"/preco — Preço atual do BRZ\n"
+            f"/status — Preço atual do BRZ\n"
+            f"/help — Esta mensagem\n\n"
+            f"⚙️ <b>Configurações:</b>\n"
+            f"• Atualização a cada {PRICE_REPORT_INTERVAL_MIN} min\n"
+            f"• Alerta de preço ≥ {PRICE_CHANGE_THRESHOLD_PCT}%\n"
+            f"• Alerta de volume ≥ {VOLUME_CHANGE_THRESHOLD_PCT}%\n\n"
+            f"📡 Status: {status_emoji}"
         )
-        await send_telegram(reply)
+        await send_telegram(reply, chat_id)
 
     return {"ok": True}
