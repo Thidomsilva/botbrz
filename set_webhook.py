@@ -12,8 +12,25 @@ TOKEN = os.environ["TELEGRAM_TOKEN"]
 VERCEL_URL = os.environ["VERCEL_URL"].rstrip("/")
 WEBHOOK_URL = f"{VERCEL_URL}/api/telegram/webhook"
 
-resp = httpx.post(
+COMMANDS = [
+  {"command": "ativar", "description": "Ativa o monitoramento"},
+  {"command": "desativar", "description": "Pausa o monitoramento"},
+  {"command": "preco", "description": "Mostra o preco atual do BRZ"},
+  {"command": "status", "description": "Mostra o status atual"},
+  {"command": "help", "description": "Lista os comandos"},
+]
+
+with httpx.Client(timeout=20) as client:
+  webhook_resp = client.post(
     f"https://api.telegram.org/bot{TOKEN}/setWebhook",
     json={"url": WEBHOOK_URL, "allowed_updates": ["message"]},
-)
-print(resp.json())
+  )
+  commands_resp = client.post(
+    f"https://api.telegram.org/bot{TOKEN}/setMyCommands",
+    json={"commands": COMMANDS},
+  )
+  info_resp = client.get(f"https://api.telegram.org/bot{TOKEN}/getWebhookInfo")
+
+print("setWebhook:", webhook_resp.json())
+print("setMyCommands:", commands_resp.json())
+print("getWebhookInfo:", info_resp.json())

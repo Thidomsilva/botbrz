@@ -227,7 +227,9 @@ async def telegram_webhook(request: Request):
     """Processa comandos do Telegram."""
     body = await request.json()
     message = body.get("message", {})
-    text     = message.get("text", "").strip().lower().split()[0]  # pega só o comando
+    raw_text = message.get("text", "")
+    parts = raw_text.strip().lower().split()
+    text = parts[0].split("@")[0] if parts else ""
     chat_id  = str(message.get("chat", {}).get("id", ""))
 
     if not chat_id or not text.startswith("/"):
