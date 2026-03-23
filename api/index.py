@@ -20,8 +20,9 @@ app = FastAPI(title="BRZ Monitor API")
 TELEGRAM_TOKEN              = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID            = os.getenv("TELEGRAM_CHAT_ID", "")
 COINGECKO_API_KEY           = os.getenv("COINGECKO_API_KEY", "")
-UPSTASH_URL                 = os.getenv("UPSTASH_REDIS_REST_URL", "")
-UPSTASH_TOKEN               = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+# Vercel KV (Redis integrado ao Vercel — crie em Storage → KV no dashboard)
+KV_URL   = os.getenv("KV_REST_API_URL", "")
+KV_TOKEN = os.getenv("KV_REST_API_TOKEN", "")
 
 PRICE_CHANGE_THRESHOLD_PCT  = float(os.getenv("PRICE_CHANGE_PCT", "1.5"))
 VOLUME_CHANGE_THRESHOLD_PCT = float(os.getenv("VOLUME_CHANGE_PCT", "80"))
@@ -29,33 +30,33 @@ PRICE_REPORT_INTERVAL_MIN   = int(os.getenv("PRICE_REPORT_INTERVAL", "5"))
 
 # ── Upstash Redis (REST) ──────────────────────────────────────────────────────
 async def redis_get(key: str) -> str | None:
-    if not UPSTASH_URL:
+    if not KV_URL:
         return None
     async with httpx.AsyncClient(timeout=5) as c:
         r = await c.get(
-            f"{UPSTASH_URL}/get/{key}",
-            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+            f"{KV_URL}/get/{key}",
+            headers={"Authorization": f"Bearer {KV_TOKEN}"},
         )
         return r.json().get("result")
 
 async def redis_set(key: str, value: str) -> None:
-    if not UPSTASH_URL:
+    if not KV_URL:
         return
     async with httpx.AsyncClient(timeout=5) as c:
         await c.post(
-            f"{UPSTASH_URL}/set/{key}",
-            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+            f"{KV_URL}/set/{key}",
+            headers={"Authorization": f"Bearer {KV_TOKEN}"},
             json=[value],
         )
 
 async def redis_mget(*keys: str) -> list:
     """Busca múltiplas chaves num único round-trip."""
-    if not UPSTASH_URL:
+    if not KV_URL:
         return [None] * len(keys)
     async with httpx.AsyncClient(timeout=5) as c:
         r = await c.post(
-            f"{UPSTASH_URL}/pipeline",
-            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+            f"{KV_URL}/pipeline",
+            headers={"Authorization": f"Bearer {KV_TOKEN}"},
             json=[["GET", k] for k in keys],
         )
         return [item.get("result") for item in r.json()]
