@@ -23,10 +23,11 @@ COINGECKO_API_KEY           = os.getenv("COINGECKO_API_KEY", "")
 # Vercel KV (Redis integrado ao Vercel — crie em Storage → KV no dashboard)
 KV_URL   = os.getenv("KV_REST_API_URL", "")
 KV_TOKEN = os.getenv("KV_REST_API_TOKEN", "")
+KV_ENABLED = bool(KV_URL and KV_TOKEN)
 
 PRICE_CHANGE_THRESHOLD_PCT  = float(os.getenv("PRICE_CHANGE_PCT", "1.5"))
 VOLUME_CHANGE_THRESHOLD_PCT = float(os.getenv("VOLUME_CHANGE_PCT", "80"))
-PRICE_REPORT_INTERVAL_MIN   = int(os.getenv("PRICE_REPORT_INTERVAL", "5"))
+PRICE_REPORT_INTERVAL_MIN   = max(5, int(os.getenv("PRICE_REPORT_INTERVAL", "5")))
 
 # ── Upstash Redis (REST) ──────────────────────────────────────────────────────
 async def redis_get(key: str) -> str | None:
@@ -160,6 +161,12 @@ def fmt_volume_alert(p: dict, pct_vol: float) -> str:
 async def check_and_alert() -> dict:
     """Chamada pelo cron externo (GET /api/check) a cada minuto."""
 
+    if not KV_ENABLED:
+        return {
+            "status": "skipped",
+            "message": "Monitoramento automatico desativado: configure KV_REST_API_URL e KV_REST_API_TOKEN.",
+        }
+
     # Lê todo o estado do Redis num único round-trip
     vals = await redis_mget(
         "bot_enabled", "last_price_usd", "last_price_brl",
@@ -255,15 +262,22 @@ async def telegram_webhook(request: Request):
         await send_telegram(reply, chat_id)
 
     elif text == "/ativar":
-        await redis_set("bot_enabled", "1")
-        await redis_set("last_report_ts", "0")   # força envio imediato no próximo cron
-        reply = (
-            "✅ <b>Monitor ativado!</b>\n\n"
-            f"Você receberá:\n"
-            f"• Atualização de preço a cada {PRICE_REPORT_INTERVAL_MIN} min\n"
-            f"• Alerta quando preço variar ≥ {PRICE_CHANGE_THRESHOLD_PCT}%\n"
-            f"• Alerta quando volume subir ≥ {VOLUME_CHANGE_THRESHOLD_PCT}%"
-        )
+        if not KV_ENABLED:
+            reply = (
+                "⚠️ <b>Monitoramento automático indisponível.</b>\n\n"
+                "Configure as variáveis KV_REST_API_URL e KV_REST_API_TOKEN para salvar o estado entre execuções do cron.\n\n"
+                "Enquanto isso, use /preco para consultar manualmente."
+            )
+        else:
+            await redis_set("bot_enabled", "1")
+            await redis_set("last_report_ts", "0")   # força envio imediato no próximo cron
+            reply = (
+                "✅ <b>Monitor ativado!</b>\n\n"
+                f"Você receberá:\n"
+                f"• Atualização de preço a cada {PRICE_REPORT_INTERVAL_MIN} min\n"
+                f"• Alerta quando preço variar ≥ {PRICE_CHANGE_THRESHOLD_PCT}%\n"
+                f"• Alerta quando volume subir ≥ {VOLUME_CHANGE_THRESHOLD_PCT}%"
+            )
         await send_telegram(reply, chat_id)
 
     elif text == "/desativar":
@@ -273,7 +287,10 @@ async def telegram_webhook(request: Request):
 
     elif text == "/help":
         enabled = await redis_get("bot_enabled")
-        status_emoji = "✅ Ativo" if enabled != "0" else "⏸ Pausado"
+        if not KV_ENABLED:
+            status_emoji = "⚠️ Sem KV"
+        else:
+            status_emoji = "✅ Ativo" if enabled != "0" else "⏸ Pausado"
         reply = (
             f"🤖 <b>BRZ Monitor — Comandos</b>\n\n"
             f"/ativar — Ativa o monitoramento\n"
