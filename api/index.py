@@ -164,7 +164,7 @@ async def check_and_alert() -> dict:
     if not KV_ENABLED:
         return {
             "status": "skipped",
-            "message": "Monitoramento automatico desativado: configure KV_REST_API_URL e KV_REST_API_TOKEN.",
+            "message": "Monitoramento automático indisponível. Configure KV_REST_API_URL e KV_REST_API_TOKEN para salvar o estado entre execuções do cron.",
         }
 
     # Lê todo o estado do Redis num único round-trip
@@ -264,7 +264,7 @@ async def telegram_webhook(request: Request):
     elif text == "/ativar":
         if not KV_ENABLED:
             reply = (
-                "⚠️ <b>Monitoramento automático indisponível.</b>\n\n"
+                "⚠️ Monitoramento automático indisponível.\n\n"
                 "Configure as variáveis KV_REST_API_URL e KV_REST_API_TOKEN para salvar o estado entre execuções do cron.\n\n"
                 "Enquanto isso, use /preco para consultar manualmente."
             )
